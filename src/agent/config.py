@@ -18,5 +18,5 @@ os.environ["LANGSMITH_ENDPOINT"] = st.secrets.get("LANGSMITH_ENDPOINT", "https:/
 os.environ["LANGSMITH_PROJECT"] = st.secrets.get("LANGSMITH_PROJECT", "AI_Research_Agent")
 os.environ["LANGSMITH_API_KEY"] = get_secret("LANGSMITH_API_KEY")
 
-search_tool = TavilySearch(k=3)
-llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, max_completion_tokens=250)
+search_tool = TavilySearch(max_results=3)
+llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.2, max_completion_tokens=750)

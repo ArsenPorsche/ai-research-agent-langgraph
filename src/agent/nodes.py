@@ -1,51 +1,46 @@
 import streamlit as st
-from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.messages import SystemMessage
 from pydantic import BaseModel, Field
 import logging
+from typing import Literal, Dict, Any 
 from .config import search_tool, llm
 from .state import AgentState
+from .prompts import RESEARCHER_PROMPT, WRITER_PROMPT, CRITIC_PROMPT
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
 class CriticVerdict(BaseModel):
-    is_approved: bool = Field(description="True if the report contains specific facts about the topic, False otherwise.")
-    feedback: str = Field(description="If False, provide a specific search strategy or critique. If True, reply with EXACTLY 'OK'.")
+    is_approved: bool = Field(description="True if the report is perfect and ready.")
+    feedback: str = Field(description="If not approved, explain what needs to be fixed.")
+    next_action: Literal["writer", "researcher", "end"] = Field(
+        description="If approved, 'end'. If missing info from internet, 'researcher'. If poor synthesis or formatting, 'writer'."
+    )
 
-def researcher_node(state: AgentState):
+def researcher_node(state: AgentState) -> Dict[str, Any]:
     iterations = state.get("ln_iterations", 0)
-    logger.info(f"--- ENTERING RESEARCHER NODE (Iteration: {iterations}) ---")
-
     topic = state['topic']
     notes = state.get('critique_notes', '')
     
+    logger.info(f"--- ENTERING RESEARCHER NODE (Iteration: {iterations}) ---")
 
     if notes and notes != "OK":
-        query_gen_prompt = f"""You are a search expert. 
-        Your previous search for "{topic}" was rejected with this critique: "{notes}".
-        Generate a more specific and effective search query to find factual data.
-        Return ONLY the text of the new query, no quotes or explanations."""
-        
-        optimized_query = llm.invoke(query_gen_prompt).content.strip()
+        optimized_query = llm.invoke(RESEARCHER_PROMPT.format(topic=topic, notes=notes)).content.strip()
         search_query = optimized_query
         logger.info(f"Optimized query: {search_query}")
     else:
         search_query = topic
         logger.info(f"Initial search query: {search_query}")
 
-
     try:
-        logger.info("Calling search tool...")
         search_result = search_tool.invoke({'query': search_query})
     except Exception as e:
         logger.error(f"Search tool error: {e}")
         st.error(f"Error occurred while searching: {e}")
-        return {"sources": [], "critique_notes": "Error occurred while searching. Try again.", "ln_iterations": iterations + 1}
+        return {"sources": [], "critique_notes": "Error occurred while searching. Try again."}
 
     new_data = []
-
     results_list = search_result.get("results", []) if isinstance(search_result, dict) else search_result
-
     if not isinstance(results_list, list):
         results_list = [results_list]
 
@@ -58,48 +53,42 @@ def researcher_node(state: AgentState):
             new_data.append(str(res))
     
     logger.info(f"Found {len(new_data)} sources.")
-
-    return {
-        "sources": new_data, 
-        "ln_iterations": iterations + 1
-    }
+    return { "sources": new_data }
 
 
-def writer_node(state: AgentState):
+def writer_node(state: AgentState) -> Dict[str, Any]:
     logger.info("--- ENTERING WRITER NODE ---")
+    
     cleaned_sources = [s[:1500] for s in state["sources"]]
     context = "\n\n--- SOURCE ---\n".join(cleaned_sources)
 
-    system_message = f"""Write a purely factual Markdown report on: "{state['topic']}".
-        Context data:
-        {context}
-
-        Rules:
-        1. Extract only verified facts and core concepts. Ignore noise.
-        2. Structure dynamically with appropriate Markdown headings (##).
-        3. Explicitly state any contradictions.
-        """
+    notes = state.get('critique_notes', '')
+    critique_context = f"\n--- CRITIC'S FEEDBACK ---\n{notes}\nIMPERATIVE: Fix ONLY the specific errors mentioned." if notes and notes.startswith("WRITER:") else ""
     
-    response = llm.invoke([SystemMessage(content=system_message)])
+    formatted_prompt = WRITER_PROMPT.format(
+        topic=state['topic'], 
+        context=context, 
+        critique_context=critique_context
+    )
     
+    response = llm.invoke([SystemMessage(content=formatted_prompt)])
     return {"report": response.content}
 
-def critic_node(state: AgentState):
+def critic_node(state: AgentState) -> Dict[str, Any]:
     logger.info("--- ENTERING CRITIC NODE ---")
-    critic_prompt = f"""EXAMINE THIS REPORT:
     
-    {state['report']}
-
-    TASK: Does this report contain SPECIFIC facts about "{state['topic']}"?
-    Validate the report based on the requirements.
-    """
-    
+    formatted_prompt = CRITIC_PROMPT.format(report=state['report'], topic=state['topic'])
     structured_llm = llm.with_structured_output(CriticVerdict)
-    response = structured_llm.invoke(critic_prompt)
+    response = structured_llm.invoke(formatted_prompt)
     
-    if response.is_approved:
+    iterations = state.get("ln_iterations", 0)
+
+    if response.is_approved or response.next_action == "end":
         logger.info("Critic APPROVED the report.")
-        return {"critique_notes": "OK"}
+        return {"critique_notes": "END: OK", "ln_iterations": iterations + 1}
     else:
-        logger.info(f"Critic REJECTED the report. Feedback: {response.feedback}")
-        return {"critique_notes": response.feedback}
+        logger.warning(f"Critic REJECTED. Next action: {response.next_action}")
+        return {
+            "critique_notes": f"{response.next_action.upper()}: {response.feedback}", 
+            "ln_iterations": iterations + 1
+        }
